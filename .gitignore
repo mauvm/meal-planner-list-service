@@ -11,6 +11,9 @@
 # Production
 /build/
 
+# Persistence
+/.data/
+
 # Misc
 .DS_Store
 

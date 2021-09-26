@@ -4,7 +4,7 @@
 
 This TypeScript service is part of the [Meal Planner project](https://github.com/users/mauvm/projects/1).
 
-This service requires an [EventStore](https://eventstore.com/) instance for persistance.
+This service uses [NeDB](https://github.com/louischatriot/nedb) for local event persistance.
 
 ## Local Development
 
@@ -15,9 +15,6 @@ chmod 600 .env
 edit .env
 
 yarn install
-
-# See https://github.com/mauvm/meal-planner-infrastructure
-kubectl port-forward -n meal-planner service/event-store-service 1113:1113
 
 yarn dev
 yarn test:dev

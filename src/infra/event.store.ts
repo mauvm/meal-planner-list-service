@@ -1,15 +1,11 @@
+import path from 'path'
 import assert from 'assert'
 import { singleton } from 'tsyringe'
-import {
-  createConnection,
-  createJsonEventData,
-  EventStoreNodeConnection,
-  expectedVersion,
-  UserCredentials,
-} from 'node-eventstore-client'
+import DataStore from 'nedb-promises'
 import { v4 as uuid } from 'uuid'
 import AutoLoadableStore from './autoLoadableStore.interface'
 import LoggerService from '../domain/logger.service'
+import ConfigService from '../domain/config.service'
 import UserEntity from '../domain/user.entity'
 
 export class Event {
@@ -28,6 +24,7 @@ export class Event {
   applyTo(aggregate: any): void {
     this.assertAggregateId(aggregate)
 
+    // Fold left
     Object.assign(aggregate, this.data)
   }
 
@@ -37,6 +34,14 @@ export class Event {
       `Invalid aggregate ID for ${this.type} event (${aggregate.id} must be equal to ${this.data.id})`,
     )
   }
+}
+
+type EventDocument = {
+  eventId: string
+  type: string
+  data: any
+  meta: any
+  createdAt: Date
 }
 
 export type EventCallback = (event: Event) => void
@@ -49,56 +54,37 @@ export function registerEventClass(eventClass: typeof Event) {
 
 @singleton()
 export default class EventStore implements AutoLoadableStore {
-  private client: EventStoreNodeConnection
+  private dataStores: { [streamName: string]: DataStore } = {}
+  private timers: NodeJS.Timeout[] = []
 
-  constructor(private logger: LoggerService) {}
+  constructor(private logger: LoggerService, private config: ConfigService) {}
 
   async init() {
-    // @todo Improve authentication
-    const username = 'admin'
-    const password = 'changeit'
-    const host = process.env.EVENT_STORE_SERVICE_SERVICE_HOST || 'localhost'
-    const port = Number(
-      process.env.EVENT_STORE_SERVICE_SERVICE_PORT_TCP_CLIENT_API || 1113,
-    )
-
-    this.client = createConnection(
-      {
-        // log: {
-        //   debug: (fmt, ...args) => {
-        //     this.logger.debug(`EventStore: ${fmt}`, args)
-        //   },
-        //   info: (fmt, ...args) => {
-        //     this.logger.info(`EventStore: ${fmt}`, args)
-        //   },
-        //   error: (fmt, ...args) => {
-        //     this.logger.error(`EventStore: ${fmt}`, args)
-        //   },
-        // },
-        defaultUserCredentials: new UserCredentials(username, password),
-        maxReconnections: -1, // No limit
-      },
-      `tcp://${host}:${port}`,
-    )
-
-    this.client.once('connected', () => {
-      this.logger.debug('EventStore connected', { host, port })
-    })
-    // this.client.on('heartbeatInfo', (info) => {
-    //   this.logger.debug('Heartbeat from EventStore', { info })
-    // })
-    this.client.once('error', (err) => {
-      this.logger.error(`EventStore error: ${err.message}`)
-    })
-    this.client.once('closed', (reason) => {
-      this.logger.debug('EventStore connection closed', { reason })
-    })
-
-    await this.client.connect()
+    // Data stores are lazy loaded
   }
 
   async cleanUp() {
-    this.client.close()
+    this.timers.forEach(clearInterval)
+  }
+
+  private async getDataStore(streamName: string): Promise<DataStore> {
+    if (!this.dataStores[streamName]) {
+      const dataStore = DataStore.create({
+        filename: path.join(
+          this.config.get('database.basePath', process.cwd()),
+          `${streamName}.db.json`,
+        ),
+        timestampData: true,
+      })
+
+      await dataStore.ensureIndex({ fieldName: 'eventId', unique: true })
+      await dataStore.ensureIndex({ fieldName: 'createdAt' })
+      await dataStore.load()
+
+      this.dataStores[streamName] = dataStore
+    }
+
+    return this.dataStores[streamName]
   }
 
   async persistEvent(
@@ -106,63 +92,76 @@ export default class EventStore implements AutoLoadableStore {
     event: Event,
     user: UserEntity,
   ): Promise<string> {
-    const eventToStore = createJsonEventData(
-      uuid(),
-      event.data,
-      { userId: user.id },
-      event.type,
-    )
+    const eventToStore: EventDocument = {
+      eventId: uuid(),
+      type: event.type,
+      data: event.data,
+      meta: { userId: user.id },
+      createdAt: new Date(),
+    }
 
     this.logger.debug(`Appending ${streamName}:${eventToStore.type} event..`, {
       streamName,
       event,
-      eventToStore: {
-        eventId: eventToStore.eventId,
-        type: eventToStore.type,
-        isJSON: eventToStore.isJson,
-        // Log as base64 instead of byte array (Buffer)
-        dataBase64: eventToStore.data.toString('base64'),
-        metadataBase64: eventToStore.metadata.toString('base64'),
-      },
+      eventToStore,
     })
 
-    const writeResult = await this.client.appendToStream(
-      streamName,
-      expectedVersion.any,
-      eventToStore,
-    )
+    const dataStore = await this.getDataStore(streamName)
+    await dataStore.insert(eventToStore)
 
     this.logger.debug(`Appended ${streamName}:${event.type} event`, {
       event,
       storedEventId: eventToStore.eventId,
-      writeResult,
     })
 
     return eventToStore.eventId
   }
 
   catchUpStream(streamName: string, callback: EventCallback): void {
-    this.client.subscribeToStreamFrom(streamName, null, false, (_, event) => {
-      const eventId = event!.event!.eventId
-      const type = String(event!.event!.eventType)
-      const data = JSON.parse(event!.event!.data!.toString('utf8'))
+    let lastDate = new Date(2000, 1)
 
-      let eventClass = eventClasses.find(
-        (eventClass) => eventClass.type === type,
-      )
+    this.getDataStore(streamName).then((dataStore) => {
+      function catchUp() {
+        dataStore
+          .find({ createdAt: { $gt: lastDate } })
+          .sort({ createdAt: 1 })
+          .limit(100)
+          .exec()
+          .then((documents: any) => {
+            for (const document of documents as EventDocument[]) {
+              if (document.createdAt > lastDate) {
+                lastDate = document.createdAt
+              }
 
-      if (!eventClass) {
-        this.logger.error(`No event handler for "${type}"`, {
-          streamName,
-          eventId,
-          type,
-          data,
-        })
-        return
+              const { eventId, type, data } = document
+
+              const eventClass = eventClasses.find(
+                (foundClass) => foundClass.type === type,
+              )
+
+              if (!eventClass) {
+                this.logger.error(`No event handler for "${type}"`, {
+                  streamName,
+                  eventId,
+                  type,
+                  data,
+                })
+                return
+              }
+
+              const observedEvent = new eventClass(eventId, data.id, data)
+              callback(observedEvent)
+            }
+          })
+          .catch((err) => {
+            this.logger.error(
+              `Error catching up with stream ${streamName}: ${err.message}`,
+            )
+          })
       }
 
-      const observedEvent = new eventClass(eventId, data.id, data)
-      callback(observedEvent)
+      catchUp()
+      this.timers.push(setInterval(catchUp, 1000))
     })
   }
 }
