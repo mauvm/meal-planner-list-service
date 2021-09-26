@@ -5,8 +5,10 @@ import AutoLoadableStore from '../autoLoadableStore.interface'
 import EventStore, { Event } from '../event.store'
 
 @singleton()
-export default class ListItemStore extends BaseStore
-  implements AutoLoadableStore {
+export default class ListItemStore
+  extends BaseStore
+  implements AutoLoadableStore
+{
   protected readonly streamName: string = 'list-items'
 
   constructor(

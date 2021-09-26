@@ -4,10 +4,8 @@ import EventStore, { Event, EventCallback } from './event.store'
 
 @singleton()
 export default class EventMockStore extends EventStore {
-  private streamListeners: Map<
-    string,
-    Array<(event: Event) => void>
-  > = new Map()
+  private streamListeners: Map<string, Array<(event: Event) => void>> =
+    new Map()
 
   async init() {}
   async cleanUp() {}
