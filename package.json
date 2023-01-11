@@ -21,7 +21,7 @@
   },
   "dependencies": {
     "class-transformer": "^0.3.1",
-    "class-validator": "^0.12.1",
+    "class-validator": "^0.14.0",
     "cli-highlight": "^2.1.4",
     "constant-case": "^3.0.3",
     "dotenv": "^8.2.0",
